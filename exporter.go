@@ -6,19 +6,18 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	plusclient "github.com/nginxinc/nginx-plus-go-client/client"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	plusclient "github.com/nginxinc/nginx-plus-go-client/client"
 	"github.com/nginxinc/nginx-prometheus-exporter/client"
 	"github.com/nginxinc/nginx-prometheus-exporter/collector"
 	"github.com/prometheus/client_golang/prometheus"
@@ -297,11 +296,6 @@ For NGINX, the stub_status page must be available through the URI. For NGINX Plu
 func main() {
 	flag.Parse()
 
-	commitHash, commitTime, dirtyBuild := getBuildInfo()
-	arch := fmt.Sprintf("%v/%v", runtime.GOOS, runtime.GOARCH)
-
-	fmt.Printf("NGINX Prometheus Exporter version=%v commit=%v date=%v, dirty=%v, arch=%v, go=%v\n", version, commitHash, commitTime, dirtyBuild, arch, runtime.Version())
-
 	if *displayVersion {
 		os.Exit(0)
 	}
@@ -318,10 +312,6 @@ func main() {
 				constLabels.labels,
 				prometheus.Labels{
 					"version": version,
-					"commit":  commitHash,
-					"date":    commitTime,
-					"dirty":   strconv.FormatBool(dirtyBuild),
-					"arch":    arch,
 					"go":      runtime.Version(),
 				},
 			),
@@ -396,25 +386,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if *nginxPlus {
-		plusClient, err := createClientWithRetries(func() (interface{}, error) {
-			return plusclient.NewNginxClient(httpClient, *scrapeURI)
-		}, *nginxRetries, nginxRetryInterval.Duration)
-		if err != nil {
-			log.Fatalf("Could not create Nginx Plus Client: %v", err)
-		}
-		variableLabelNames := collector.NewVariableLabelNames(nil, nil, nil, nil, nil, nil)
-		registry.MustRegister(collector.NewNginxPlusCollector(plusClient.(*plusclient.NginxClient), "nginxplus", variableLabelNames, constLabels.labels))
-	} else {
-		ossClient, err := createClientWithRetries(func() (interface{}, error) {
-			return client.NewNginxClient(httpClient, *scrapeURI)
-		}, *nginxRetries, nginxRetryInterval.Duration)
-		if err != nil {
-			log.Fatalf("Could not create Nginx Client: %v", err)
-		}
-		registry.MustRegister(collector.NewNginxCollector(ossClient.(*client.NginxClient), "nginx", constLabels.labels))
-	}
-	http.Handle(*metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	http.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
+		ProbeHandler(w, r, httpClient, registry)
+	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, err := fmt.Fprintf(w, `<!DOCTYPE html>
@@ -474,22 +448,30 @@ func cloneRequest(req *http.Request) *http.Request {
 	return r
 }
 
-func getBuildInfo() (string, string, bool) {
-	var commitHash, commitTime string
-	var dirtyBuild bool
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "", "", false
+func ProbeHandler(w http.ResponseWriter, r *http.Request, httpClient *http.Client, registry *prometheus.Registry) {
+	dsn := r.URL.Query().Get("dsn")
+	if dsn == "" {
+		http.Error(w, fmt.Sprintf("dsn empty %q", dsn), http.StatusBadRequest)
+		return
 	}
-	for _, kv := range info.Settings {
-		switch kv.Key {
-		case "vcs.revision":
-			commitHash = kv.Value
-		case "vcs.time":
-			commitTime = kv.Value
-		case "vcs.modified":
-			dirtyBuild = kv.Value == "true"
+	if *nginxPlus {
+		plusClient, err := createClientWithRetries(func() (interface{}, error) {
+			return plusclient.NewNginxClient(httpClient, *scrapeURI)
+		}, *nginxRetries, nginxRetryInterval.Duration)
+		if err != nil {
+			log.Fatalf("Could not create Nginx Plus Client: %v", err)
 		}
+		variableLabelNames := collector.NewVariableLabelNames(nil, nil, nil, nil, nil, nil)
+		registry.MustRegister(collector.NewNginxPlusCollector(plusClient.(*plusclient.NginxClient), "nginxplus", variableLabelNames, constLabels.labels))
+	} else {
+		ossClient, err := createClientWithRetries(func() (interface{}, error) {
+			return client.NewNginxClient(httpClient, *scrapeURI)
+		}, *nginxRetries, nginxRetryInterval.Duration)
+		if err != nil {
+			log.Fatalf("Could not create Nginx Client: %v", err)
+		}
+		registry.MustRegister(collector.NewNginxCollector(ossClient.(*client.NginxClient), "nginx", constLabels.labels))
 	}
-	return commitHash, commitTime, dirtyBuild
+	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	h.ServeHTTP(w, r)
 }
